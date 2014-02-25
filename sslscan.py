@@ -106,6 +106,7 @@ def test_preferred_cipher(server, port, method):
         headers = make_request(sock, server)
 
         # TODO: extract the actual cipher in use
+        print('Preferred cipher for %s: %s' % (method, sock.cipher()))
     except SSL.Error as e:
         pass
     finally:
@@ -133,7 +134,7 @@ def main():
     with futures.ThreadPoolExecutor(max_workers=threads) as executor:
         results = []
 
-        for method in ['SSLv3', 'TLSv1']:
+        for method in ['SSLv2', 'SSLv3', 'TLSv1']:
             supported_ciphers = get_all_ciphers(method)
 
             # Test each individual cipher.

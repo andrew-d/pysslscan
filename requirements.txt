@@ -1,0 +1,9 @@
+cffi==0.8.1
+cryptography==0.2.1
+futures==2.1.6
+http-parser==0.8.3
+pycparser==2.10
+six==1.5.2
+
+# This is until the .cipher() and SSLv2 patches get upstreamed
+git+git://github.com/andrew-d/pyopenssl.git@andrew-fork
