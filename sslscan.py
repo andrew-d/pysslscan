@@ -2,6 +2,9 @@
 
 from __future__ import print_function
 
+__author__ = 'Andrew Dunham <andrew@du.nham.ca>'
+__version__ = '0.0.1'
+
 import sys
 import socket
 from concurrent import futures
@@ -11,10 +14,12 @@ try:
     from http_parser.parser import HttpParser
 except ImportError:
     from http_parser.pyparser import HttpParser
+from cryptography.hazmat.bindings.openssl.binding import Binding as OpenSSLBinding
 
 
-__author__ = 'Andrew Dunham <andrew@du.nham.ca>'
-__version__ = '0.0.1'
+binding = OpenSSLBinding()
+binding_ffi = binding.ffi
+binding_lib = binding.lib
 
 
 def get_all_ciphers(method):
@@ -28,7 +33,7 @@ def get_all_ciphers(method):
         context.set_cipher_list("ALL:COMPLEMENTOFALL")
         sock = SSL.Connection(context, sock)
         ciphers = sock.get_cipher_list()
-    except Exception:
+    except SSL.Error:
         ciphers = []
     finally:
         sock.close()
@@ -66,6 +71,18 @@ def make_request(sock, server_name):
     return headers
 
 
+def get_cipher_bits(sock):
+    """
+    Given a socket, gets the number of bits that the current cipher is using.
+    *Very* heavily dependent on the implementation of pyOpenSSL right now. :-(
+    """
+    cipher = binding_lib.SSL_get_current_cipher(sock._ssl)
+    if cipher == binding_ffi.NULL:
+        return None
+
+    return binding_lib.SSL_CIPHER_get_bits(cipher, binding_ffi.NULL)
+
+
 def test_single_cipher(server, port, method, cipher):
     """
     Test to see if the server supports a given method/cipher combination.
@@ -79,10 +96,10 @@ def test_single_cipher(server, port, method, cipher):
         sock = SSL.Connection(context, sock)
         sock.connect((server, port))
 
-        began, headers = make_request(sock, server)
+        headers = make_request(sock, server)
 
-        if began:
-            print('Accepted\t' + method + '\t' + cipher)
+        bits = get_cipher_bits(sock)
+        print('Accepted\t' + method + '\t' + cipher + '\t(%d bits)' % (bits,))
     except SSL.Error as e:
         print('Failed\t' + method + '\t' + cipher)
     finally:
@@ -105,8 +122,30 @@ def test_preferred_cipher(server, port, method):
 
         headers = make_request(sock, server)
 
-        # TODO: extract the actual cipher in use
         print('Preferred cipher for %s: %s' % (method, sock.cipher()))
+    except SSL.Error as e:
+        pass
+    finally:
+        sock.close()
+
+
+def validate_cert_chain(server, port):
+    """
+    Validate the server's certificate chain.
+    """
+    context = SSL.Context(SSL.SSLv23_METHOD)
+    context.set_cipher_list("ALL:COMPLEMENTOFALL")
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock = SSL.Connection(context, sock)
+        sock.connect((server, port))
+
+        headers = make_request(sock, server)
+
+        chain = sock.get_peer_cert_chain()
+        for i, cert in enumerate(chain):
+            print('%d: %s' % (i, cert.get_subject().commonName))
     except SSL.Error as e:
         pass
     finally:
@@ -131,8 +170,15 @@ def main():
         __version__, ssl_version
     ))
 
+    # validate_cert_chain(server, port)
+    # return
+
+    # Note that this statement will wait for all executed things to finish.
     with futures.ThreadPoolExecutor(max_workers=threads) as executor:
         results = []
+
+        # Validate certificate chain for the server.
+        results.append(executor.submit(validate_cert_chain, server, port))
 
         for method in ['SSLv2', 'SSLv3', 'TLSv1']:
             supported_ciphers = get_all_ciphers(method)
