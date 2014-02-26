@@ -364,6 +364,24 @@ def main():
             print(" %s: %s" % (method, cipher_as_str(preferred)))
         else:
             print(" %s: None" % (method,))
+    print('')
+
+    # Lastly, print any problems found
+    print('Problems:')
+    print('-' * 20)
+
+    if len(list(host.accepted_ciphers_for('SSLv2'))) > 0:
+        print("- Host supports SSLv2")
+
+    anon_ciphers = []
+    for method in SSL_METHODS:
+        for cipher in sorted(host.accepted_ciphers_for(method)):
+            if cipher.bits == 'Anon':
+                anon_ciphers.append(cipher)
+    if len(anon_ciphers) > 0:
+        print('- Host supports anonymous cipher suites')
+        for x in anon_ciphers:
+            print('  - %s' % (x,))
 
 
 if __name__ == "__main__":
