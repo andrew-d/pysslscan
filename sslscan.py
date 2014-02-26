@@ -374,13 +374,25 @@ def main():
         print("- Host supports SSLv2")
 
     anon_ciphers = []
+    weak_ciphers = []
     for method in SSL_METHODS:
         for cipher in sorted(host.accepted_ciphers_for(method)):
             if cipher.bits == 'Anon':
                 anon_ciphers.append(cipher)
+            elif cipher.bits == 'Unknown':
+                # TODO: report?
+                pass
+            elif int(cipher.bits) < 128:
+                weak_ciphers.append(cipher)
+
     if len(anon_ciphers) > 0:
         print('- Host supports anonymous cipher suites')
         for x in anon_ciphers:
+            print('  - %s' % (x,))
+
+    if len(weak_ciphers) > 0:
+        print('- Host supports weak cipher suites')
+        for x in weak_ciphers:
             print('  - %s' % (x,))
 
 
