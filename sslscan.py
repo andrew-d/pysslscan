@@ -1,5 +1,22 @@
 #!/usr/bin/env python
 
+"""
+Usage:
+    sslscan [-v] [--threads=<n>] <host>
+    sslscan info <type>
+    sslscan (-h | --help)
+    sslscan --version
+
+Options:
+    -h --help       Show this help screen
+    --version       Show the version
+    -v              Be more verbose
+    --threads=<n>   Use the given number of threads (default: 5)
+
+Info Types:
+    ciphers         Ciphers supported by this version of OpenSSL
+"""
+
 from __future__ import print_function
 
 __author__ = 'Andrew Dunham <andrew@du.nham.ca>'
@@ -7,7 +24,10 @@ __version__ = '0.0.1'
 
 import sys
 import socket
+import threading
 from concurrent import futures
+from contextlib import contextmanager
+from collections import namedtuple
 
 from OpenSSL import SSL
 try:
@@ -15,11 +35,102 @@ try:
 except ImportError:
     from http_parser.pyparser import HttpParser
 from cryptography.hazmat.bindings.openssl.binding import Binding as OpenSSLBinding
+from docopt import docopt
 
 
 binding = OpenSSLBinding()
 binding_ffi = binding.ffi
 binding_lib = binding.lib
+
+SSL_METHODS = ['SSLv2', 'SSLv3', 'TLSv1', 'TLSv1_1', 'TLSv1_2']
+INSECURE_CIPHERS = [
+]
+
+
+Cipher = namedtuple('Cipher', ['method', 'name', 'bits'])
+
+
+def cipher_as_str(c):
+    if c.bits == 'Anon':
+        return "%s (Anonymous cipher)" % (c.name,)
+    else:
+        return "%s (%s bits)" % (c.name, c.bits)
+
+
+class HostInfo(object):
+    CIPHER_ACCEPTED = 0
+    CIPHER_REJECTED = 1
+    CIPHER_ERRORED  = 2
+
+    def __init__(self, server, port):
+        # Host information
+        self.server = server
+        self.port = port
+
+        # Lock for complex operations
+        self.lock = threading.Lock()
+
+        # Format: (cipher, result)
+        self.ciphers = []
+        self.preferred_ciphers = {}
+
+        self.cert_chain = None
+
+    @property
+    def address(self):
+        return (self.server, self.port)
+
+    @contextmanager
+    def lock(self):
+        """
+        Lock the structure for use with multiple threads.
+        """
+        self.lock.acquire()
+        yield
+        self.lock.release()
+
+    def report_cipher(self, method, cipher, bits, result):
+        # For anonymous ciphers, we don't care about the key size
+        if 'ADH' in cipher or 'AECDH' in cipher:
+            bits = 'Anon'
+        elif bits == -1:
+            bits = 'Unknown'
+        else:
+            bits = str(bits)
+
+        self.ciphers.append((Cipher(method, cipher, bits), result))
+
+    def report_preferred(self, method, cipher, bits):
+        # For anonymous ciphers, we don't care about the key size
+        if 'ADH' in cipher or 'AECDH' in cipher:
+            bits = 'Anon'
+        elif bits == -1:
+            bits = 'Unknown'
+        else:
+            bits = str(bits)
+
+        self.preferred_ciphers[method] = Cipher(method, cipher, bits)
+
+    @property
+    def accepted_ciphers(self):
+        return (x[0] for x in self.ciphers if x[1] == self.CIPHER_ACCEPTED)
+
+    @property
+    def rejected_ciphers(self):
+        return (x[0] for x in self.ciphers if x[1] == self.CIPHER_REJECTED)
+
+    @property
+    def errored_ciphers(self):
+        return (x[0] for x in self.ciphers if x[1] == self.CIPHER_ERRORED)
+
+    def accepted_ciphers_for(self, method):
+        return (x for x in self.accepted_ciphers if x.method == method)
+
+    def rejected_ciphers_for(self, method):
+        return (x for x in self.rejected_ciphers if x.method == method)
+
+    def errored_ciphers_for(self, method):
+        return (x for x in self.errored_ciphers if x.method == method)
 
 
 def get_all_ciphers(method):
@@ -83,7 +194,7 @@ def get_cipher_bits(sock):
     return binding_lib.SSL_CIPHER_get_bits(cipher, binding_ffi.NULL)
 
 
-def test_single_cipher(server, port, method, cipher):
+def test_single_cipher(host, method, cipher):
     """
     Test to see if the server supports a given method/cipher combination.
     """
@@ -94,19 +205,19 @@ def test_single_cipher(server, port, method, cipher):
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         sock = SSL.Connection(context, sock)
-        sock.connect((server, port))
+        sock.connect(host.address)
 
-        headers = make_request(sock, server)
+        headers = make_request(sock, host.server)
 
         bits = get_cipher_bits(sock)
-        print('Accepted\t' + method + '\t' + cipher + '\t(%d bits)' % (bits,))
+        host.report_cipher(method, cipher, bits, HostInfo.CIPHER_ACCEPTED)
     except SSL.Error as e:
-        print('Failed\t' + method + '\t' + cipher)
+        host.report_cipher(method, cipher, -1, HostInfo.CIPHER_FAILED)
     finally:
         sock.close()
 
 
-def test_preferred_cipher(server, port, method):
+def test_preferred_cipher(host, method):
     """
     Test what the server's preferred cipher is when a client will accept all
     ciphers.
@@ -118,18 +229,19 @@ def test_preferred_cipher(server, port, method):
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         sock = SSL.Connection(context, sock)
-        sock.connect((server, port))
+        sock.connect(host.address)
 
-        headers = make_request(sock, server)
+        headers = make_request(sock, host.server)
 
-        print('Preferred cipher for %s: %s' % (method, sock.cipher()))
+        preferred = sock.cipher()
+        host.report_preferred(method, preferred[0], preferred[2])
     except SSL.Error as e:
         pass
     finally:
         sock.close()
 
 
-def validate_cert_chain(server, port):
+def validate_cert_chain(host):
     """
     Validate the server's certificate chain.
     """
@@ -139,56 +251,119 @@ def validate_cert_chain(server, port):
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         sock = SSL.Connection(context, sock)
-        sock.connect((server, port))
+        sock.connect(host.address)
 
-        headers = make_request(sock, server)
+        headers = make_request(sock, host.server)
 
         chain = sock.get_peer_cert_chain()
-        for i, cert in enumerate(chain):
-            print('%d: %s' % (i, cert.get_subject().commonName))
+        host.cert_chain = chain
     except SSL.Error as e:
         pass
     finally:
         sock.close()
 
 
+def info(arguments):
+    ty = arguments['<type>']
+    if ty == 'ciphers':
+        for method in SSL_METHODS:
+            try:
+                supported_ciphers = get_all_ciphers(method)
+            except ValueError:
+                print("Method not supported: %s" % (method,))
+                continue
+
+            print("Method: %s" % (method,))
+            print("-" * 50)
+            for cipher in sorted(supported_ciphers):
+                print(cipher)
+            print('')
+
+    else:
+        print("Unknown info type: %s" % (ty,))
+
+
 def main():
+    arguments = docopt(__doc__, version=__version__)
+    if arguments['info']:
+        return info(arguments)
+
     # Get the address from the user.
-    server = sys.argv[1]
+    server = arguments['<host>']
     port   = 443
     if ':' in server:
         server, port = server.split(':', 1)
         port = int(port)
 
-    # TODO: get this from the user
-    threads = 5
+    threads = arguments['--threads']
+    if threads is None:
+        threads = 5
+    else:
+        threads = int(threads)
 
     ssl_version = SSL.SSLeay_version(SSL.SSLEAY_VERSION)
     if not isinstance(ssl_version, str):
         ssl_version = ssl_version.decode('ascii')
-    print("pySSLScan version %s (%s)" % (
-        __version__, ssl_version
-    ))
 
-    # validate_cert_chain(server, port)
-    # return
+    print_box = lambda s, **kw: print('| ' + s.ljust(59) + '|', **kw)
+    print("+" + "-" * 60 + "+")
+    print_box("pySSLScan version %s" % (__version__,))
+    print_box("  OpenSSL version: %s" % (ssl_version,))
+    print_box("  Threads:       : %d" % (threads,))
+    print_box("  Verbose:       : %s" % (bool(arguments['-v']),))
+    print("+" + "-" * 60 + "+")
+    print('')
+
+    # Create host structure.
+    host = HostInfo(server, port)
 
     # Note that this statement will wait for all executed things to finish.
+    print("Scanning, please wait... ", end='')
+    sys.stdout.flush()
     with futures.ThreadPoolExecutor(max_workers=threads) as executor:
-        results = []
-
         # Validate certificate chain for the server.
-        results.append(executor.submit(validate_cert_chain, server, port))
+        executor.submit(validate_cert_chain, host)
 
-        for method in ['SSLv2', 'SSLv3', 'TLSv1']:
-            supported_ciphers = get_all_ciphers(method)
+        for method in SSL_METHODS:
+            try:
+                supported_ciphers = get_all_ciphers(method)
+            except ValueError:
+                print("Method not supported: %s" % (method,))
+                continue
 
             # Test each individual cipher.
             for cipher in supported_ciphers:
-                results.append(executor.submit(test_single_cipher, server, port, method, cipher))
+                executor.submit(test_single_cipher, host, method, cipher)
 
             # Test for the preferred cipher suite for this method.
-            results.append(executor.submit(test_preferred_cipher, server, port, method))
+            executor.submit(test_preferred_cipher, host, method)
+
+    print('done!\n')
+
+    # Print results.
+    for method in SSL_METHODS:
+        print("Ciphers for %s:" % (method,))
+        print("-" * 20)
+
+        for cipher in sorted(host.accepted_ciphers_for(method)):
+            print(' ' + cipher_as_str(cipher))
+
+        if arguments['-v']:
+            for cipher in sorted(host.rejected_ciphers_for(method)):
+                print(' (rejected) ' + cipher_as_str(cipher))
+            for cipher in sorted(host.errored_ciphers_for(method)):
+                print(' (errored) ' + cipher_as_str(cipher))
+
+        print('')
+
+    print('Preferred Ciphers:')
+    print('-' * 20)
+    for method in SSL_METHODS:
+        preferred = host.preferred_ciphers.get(method)
+        if preferred is not None:
+            print(" %s: %s" % (method, cipher_as_str(preferred)))
+        else:
+            print(" %s: None" % (method,))
 
 
 if __name__ == "__main__":
